@@ -1,5 +1,5 @@
 import json
-from labeldispatch import operations,report
+from labeldispatch import operations,report,resources,disputes
 from labeldispatch.store import connect
 
 def write(root,name,obj):
@@ -12,7 +12,8 @@ def test_print_reprint_handoff_full_chain(tmp_path):
     assert conn.execute("SELECT status FROM print_copy WHERE id='C1'").fetchone()[0]=='作废'
     assert conn.execute("SELECT status FROM print_copy WHERE id='C2'").fetchone()[0]=='有效'
     data=json.loads(report.build(db,tmp_path/'report.json').read_text(encoding='utf-8'))
-    assert len(data['sources'])==4 and all(s['verified'] for s in data['sources'])
+    assert len(data['sources'])==5 and all(s['verified'] for s in data['sources'])
+    assert conn.execute("SELECT count(*) FROM printer_reservation WHERE status='已消耗'").fetchone()[0]==2
 
 def test_print_copy_identity_template_and_missing_receipt(tmp_path):
     db=tmp_path/'ledger.db'
@@ -66,3 +67,39 @@ def test_batch_settlement_preserves_partial_failure(tmp_path):
     result=operations.settle(db,write(tmp_path,'batch.json',{'version':'v1','rows':[{'id':'B1','handoffs':['H1']}]}))
     assert result[0]['status']=='部分失败'
     assert connect(db).execute("SELECT status FROM handoff_batch WHERE id='B1'").fetchone()[0]=='部分失败'
+
+def test_printer_capacity_template_and_paper_stock_are_independent(tmp_path):
+    db=tmp_path/'db';plan={'version':'v1','printers':[{'id':'P1','templates':['T1'],'paper':{'A6':1},'capacity':1,'online':True}],
+        'jobs':[{'copy_id':'C1','template':'T1','paper':'A6'},
+                {'copy_id':'C2','template':'T1','paper':'A6'},
+                {'copy_id':'C3','template':'T2','paper':'A6'}]}
+    assert [x['status'] for x in resources.plan(db,write(tmp_path,'plan.json',plan))]==['已预留','待资源','待资源']
+    spool={'version':'v1','rows':[{'id':'C1','parcel':'P1','paper_no':'N1','template':'T1','required_template':'T1','printed':True},
+                                  {'id':'C2','parcel':'P2','paper_no':'N2','template':'T1','required_template':'T1','printed':True}]}
+    assert [x['reason'] for x in operations.first(db,write(tmp_path,'spool.json',spool))]==['printed_and_unique','printer_reservation_missing']
+    assert connect(db).execute("SELECT status FROM printer_reservation WHERE id='C1'").fetchone()[0]=='已消耗'
+
+def test_operator_cancel_requires_physical_evidence(tmp_path):
+    db=tmp_path/'db';plan={'version':'v1','printers':[{'id':'P1','templates':['T'],'paper':{'A6':2},'capacity':2,'online':True}],
+        'jobs':[{'copy_id':'C1','template':'T','paper':'A6'}]}
+    resources.plan(db,write(tmp_path,'plan.json',plan))
+    assert resources.cancel(db,write(tmp_path,'bad.json',{'version':'v1','rows':[{'copy_id':'C1','operator':'A','evidence':'unknown'}]}))[0]['status']=='待核'
+    assert resources.cancel(db,write(tmp_path,'ok.json',{'version':'v1','rows':[{'copy_id':'C1','operator':'A','evidence':'no_paper_output'}]}))[0]['status']=='已释放'
+    spool={'version':'v1','rows':[{'id':'C1','parcel':'P1','paper_no':'N1','template':'T','required_template':'T','printed':True}]}
+    assert operations.first(db,write(tmp_path,'spool.json',spool))[0]['status']=='待资源'
+
+def test_carrier_dispute_reopens_settled_batch_and_tracks_recall(tmp_path):
+    db=tmp_path/'ledger.db';operations.demo(tmp_path)
+    same={'version':'v1','rows':[{'id':'D0','handoff':'H1','observed_copy':'C2','operator':'K'}]}
+    assert disputes.claim(db,write(tmp_path,'same.json',same))[0]['status']=='驳回'
+    mismatch={'version':'v1','rows':[{'id':'D1','handoff':'H1','observed_copy':'foreign','operator':'K'}]}
+    file=write(tmp_path,'dispute.json',mismatch)
+    assert disputes.claim(db,file)==disputes.claim(db,file)
+    conn=connect(db)
+    assert conn.execute("SELECT status FROM handoff_batch WHERE id='B1'").fetchone()[0]=='争议重开'
+    assert conn.execute("SELECT status FROM parcel WHERE id='P1'").fetchone()[0]=='召回中'
+    missing={'version':'v1','rows':[{'claim':'D1','parcel_returned':False,'operator':'K','evidence':''}]}
+    assert disputes.resolve(db,write(tmp_path,'missing.json',missing))[0]['status']=='待核'
+    returned={'version':'v1','rows':[{'claim':'D1','parcel_returned':True,'operator':'K','evidence':'scan:P1'}]}
+    assert disputes.resolve(db,write(tmp_path,'returned.json',returned))[0]['status']=='已召回'
+    assert connect(db).execute("SELECT status FROM recall_case WHERE id='recall:D1'").fetchone()[0]=='已召回'

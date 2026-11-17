@@ -1,7 +1,7 @@
 import argparse,json,tempfile
 from pathlib import Path
-from . import operations,report
-COMMANDS=['print-import', 'reprint-request', 'handoff-evaluate', 'handoff-settle']
+from . import operations,report,resources,disputes
+COMMANDS=['print-import', 'reprint-request', 'handoff-evaluate', 'handoff-settle','printer-plan','printer-cancel','carrier-claim','recall-resolve']
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
@@ -17,6 +17,7 @@ def main():
         print(report.build(root/'ledger.db',root/'report.json'))
     elif x.command=='report':print(report.build(x.db,x.out))
     else:
-        fn=getattr(operations,['first','second','third','settle'][COMMANDS.index(x.command)])
+        fn=[operations.first,operations.second,operations.third,operations.settle,
+            resources.plan,resources.cancel,disputes.claim,disputes.resolve][COMMANDS.index(x.command)]
         print(json.dumps(fn(x.db,x.file),ensure_ascii=False))
 if __name__=='__main__':main()

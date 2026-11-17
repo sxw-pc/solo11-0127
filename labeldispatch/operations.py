@@ -19,11 +19,14 @@ def first(path,file):
             seen_parcel={}
             for row in payload.get('rows',[]):
                 key=str(row['id']);paper=str(row['paper_no']);parcel=str(row['parcel'])
+                reservation=db.execute('SELECT status FROM printer_reservation WHERE id=?',(key,)).fetchone()
+                resource_required=bool(db.execute('SELECT 1 FROM printer_reservation LIMIT 1').fetchone())
                 existing=db.execute('SELECT * FROM print_copy WHERE id=?',(key,)).fetchone()
                 conflict=(paper in seen_paper and seen_paper[paper]!=parcel)
                 conflict|=bool(db.execute("SELECT 1 FROM print_copy WHERE json_extract(body,'$.paper_no')=? AND id<>?",(paper,key)).fetchone())
                 duplicate=parcel in seen_parcel or bool(db.execute("SELECT 1 FROM print_copy WHERE json_extract(body,'$.parcel')=? AND status='有效' AND id<>?",(parcel,key)).fetchone())
-                if conflict:status,reason='冲突','paper_reused'
+                if resource_required and (not reservation or reservation['status'] not in ('已预留','已消耗')):status,reason='待资源','printer_reservation_missing'
+                elif conflict:status,reason='冲突','paper_reused'
                 elif duplicate:status,reason='冲突','multiple_active_copies'
                 elif row.get('template')!=row.get('required_template'):status,reason='待补印','template_mismatch'
                 elif not row.get('printed'):status,reason='待补印','receipt_missing'
@@ -32,6 +35,9 @@ def first(path,file):
                     status,reason='冲突','copy_identity_conflict'
                 else:
                     save(db,'print_copy',key,source,payload['version'],row,status,reason)
+                if reservation:
+                    from .resources import complete
+                    complete(db,key,bool(row.get('printed')))
                 if conflict:
                     db.execute("UPDATE print_copy SET status='冲突',reason='paper_reused' WHERE json_extract(body,'$.paper_no')=?",(paper,))
                 seen_paper[paper]=parcel;seen_parcel[parcel]=key
@@ -59,6 +65,7 @@ def second(path,file):
                 elif row.get('reason') not in ('lost','damaged'):status,reason='拒绝','unsupported_reason'
                 elif at>expires or not row.get('approver'):status,reason='拒绝','authorization_invalid'
                 elif db.execute('SELECT 1 FROM reprint_grant WHERE json_extract(body,\'$.old_copy\')=? AND status=\'批准\'',(str(row['old_copy']),)).fetchone():status,reason='拒绝','already_reprinted'
+                elif db.execute('SELECT 1 FROM printer_reservation LIMIT 1').fetchone() and not db.execute("SELECT 1 FROM printer_reservation WHERE id=? AND status='已预留'",(str(row['new_copy']),)).fetchone():status,reason='待资源','reprint_resource_missing'
                 else:status,reason='批准','authorized_reprint'
                 save(db,'reprint_request',key,source,payload['version'],row,status,reason)
                 grant={'old_copy':str(row['old_copy']),'new_copy':str(row.get('new_copy','')),'approver':row.get('approver')}
@@ -69,6 +76,8 @@ def second(path,file):
                     replacement={'id':str(row['new_copy']),'parcel':original['parcel'],'paper_no':str(row['new_paper']),
                                  'template':original['template'],'required_template':original['required_template'],'printed':True}
                     save(db,'print_copy',str(row['new_copy']),source,payload['version'],replacement,'有效','authorized_reprint')
+                    from .resources import complete
+                    complete(db,str(row['new_copy']),True)
                 results.append(decide(db,'重印许可',key,status,reason,source))
         return results
     finally:db.close()
@@ -116,6 +125,12 @@ def settle(path,file):
 
 def demo(root):
     db=root/'ledger.db'
+    from .resources import plan
+    resource=root/'printers.json'
+    resource.write_text(json.dumps({'version':'v1','printers':[{'id':'P1','templates':['T1'],'paper':{'A6':10},'capacity':2,'online':True}],
+                                    'jobs':[{'copy_id':'C1','template':'T1','paper':'A6'},
+                                            {'copy_id':'C2','template':'T1','paper':'A6'}]}),encoding='utf-8')
+    plan(db,resource)
     files=[{'version':'v1','rows':[{'id':'C1','parcel':'P1','paper_no':'N1','template':'T1','required_template':'T1','printed':True}]},
            {'version':'v1','rows':[{'id':'R1','old_copy':'C1','reason':'damaged','approver':'supervisor',
                                     'at':'2026-01-01T10:00:00','expires':'2026-01-02T00:00:00',
