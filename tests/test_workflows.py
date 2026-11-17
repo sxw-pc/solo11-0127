@@ -103,3 +103,21 @@ def test_carrier_dispute_reopens_settled_batch_and_tracks_recall(tmp_path):
     returned={'version':'v1','rows':[{'claim':'D1','parcel_returned':True,'operator':'K','evidence':'scan:P1'}]}
     assert disputes.resolve(db,write(tmp_path,'returned.json',returned))[0]['status']=='已召回'
     assert connect(db).execute("SELECT status FROM recall_case WHERE id='recall:D1'").fetchone()[0]=='已召回'
+    assert operations.settle(db,tmp_path/'settlement.json')[0]['status']=='争议重开'
+    retry={'version':'v1','rows':[{'id':'H2','parcel':'P1','copy':'C2','actual_weight':1,
+        'declared_weight':1,'tolerance':0.1,'courier':'K','ack_courier':'K','ack_copy':'C2'}]}
+    assert operations.third(db,write(tmp_path,'retry.json',retry))[0]['reason']=='recall_open'
+
+def test_reprint_requires_active_original_and_unused_replacement_identity(tmp_path):
+    db=tmp_path/'db';operations.first(db,write(tmp_path,'spool.json',{'version':'v1','rows':[
+        {'id':'C1','parcel':'P1','paper_no':'N1','template':'T','required_template':'T','printed':False},
+        {'id':'C2','parcel':'P2','paper_no':'N2','template':'T','required_template':'T','printed':True}]}))
+    rows=[{'id':'R1','old_copy':'C1','reason':'damaged','approver':'A','at':'2026-01-01T10:00:00',
+           'expires':'2026-01-02T00:00:00','new_copy':'C3','new_paper':'N3'},
+          {'id':'R2','old_copy':'C2','reason':'damaged','approver':'A','at':'2026-01-01T10:00:00',
+           'expires':'2026-01-02T00:00:00','new_copy':'C1','new_paper':'N4'},
+          {'id':'R3','old_copy':'C2','reason':'damaged','approver':'A','at':'2026-01-01T10:00:00',
+           'expires':'2026-01-02T00:00:00','new_copy':'C4','new_paper':'N2'}]
+    result=operations.second(db,write(tmp_path,'requests.json',{'version':'v1','rows':rows}))
+    assert [x['reason'] for x in result]==['old_copy_not_active','replacement_identity_conflict','paper_reused']
+    assert connect(db).execute("SELECT status FROM print_copy WHERE id='C2'").fetchone()[0]=='有效'

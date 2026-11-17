@@ -62,9 +62,12 @@ def second(path,file):
                     continue
                 at=datetime.fromisoformat(row['at']);expires=datetime.fromisoformat(row['expires'])
                 if not old:status,reason='拒绝','old_copy_missing'
+                elif old['status']!='有效':status,reason='拒绝','old_copy_not_active'
                 elif row.get('reason') not in ('lost','damaged'):status,reason='拒绝','unsupported_reason'
                 elif at>expires or not row.get('approver'):status,reason='拒绝','authorization_invalid'
                 elif db.execute('SELECT 1 FROM reprint_grant WHERE json_extract(body,\'$.old_copy\')=? AND status=\'批准\'',(str(row['old_copy']),)).fetchone():status,reason='拒绝','already_reprinted'
+                elif db.execute('SELECT 1 FROM print_copy WHERE id=?',(str(row['new_copy']),)).fetchone():status,reason='拒绝','replacement_identity_conflict'
+                elif db.execute("SELECT 1 FROM print_copy WHERE json_extract(body,'$.paper_no')=?",(str(row['new_paper']),)).fetchone():status,reason='拒绝','paper_reused'
                 elif db.execute('SELECT 1 FROM printer_reservation LIMIT 1').fetchone() and not db.execute("SELECT 1 FROM printer_reservation WHERE id=? AND status='已预留'",(str(row['new_copy']),)).fetchone():status,reason='待资源','reprint_resource_missing'
                 else:status,reason='批准','authorized_reprint'
                 save(db,'reprint_request',key,source,payload['version'],row,status,reason)
@@ -90,12 +93,17 @@ def third(path,file):
         with db:
             for row in payload.get('rows',[]):
                 key=str(row['id']);copy=db.execute('SELECT * FROM print_copy WHERE id=?',(str(row['copy']),)).fetchone()
-                if not copy or copy['status']!='有效':status,reason='拒交','copy_not_valid'
+                prior=db.execute('SELECT * FROM parcel WHERE id=?',(str(row['parcel']),)).fetchone()
+                if prior and prior['status']=='召回中':status,reason='拒交','recall_open'
+                elif prior and prior['status']=='已交接' and prior['body']!=json.dumps(row,sort_keys=True,ensure_ascii=False):
+                    status,reason='拒交','parcel_already_handed_off'
+                elif not copy or copy['status']!='有效':status,reason='拒交','copy_not_valid'
                 elif json.loads(copy['body'])['parcel']!=str(row['parcel']):status,reason='拒交','copy_parcel_mismatch'
                 elif abs(float(row['actual_weight'])-float(row['declared_weight']))>float(row['tolerance']):status,reason='拒交','weight_mismatch'
                 elif row.get('courier')!=row.get('ack_courier') or row.get('ack_copy')!=row.get('copy'):status,reason='待核','ack_mismatch'
                 else:status,reason='已交接','carrier_verified'
-                save(db,'parcel',str(row['parcel']),source,payload['version'],row,status,reason)
+                if not prior or prior['body']==json.dumps(row,sort_keys=True,ensure_ascii=False):
+                    save(db,'parcel',str(row['parcel']),source,payload['version'],row,status,reason)
                 save(db,'handoff',key,source,payload['version'],{'parcel':row['parcel'],'copy':row['copy'],'courier':row.get('courier')},status,reason)
                 results.append(decide(db,'承运交接',key,status,reason,source))
         return results
@@ -109,6 +117,10 @@ def settle(path,file):
         with db:
             for row in payload.get('rows',[]):
                 key=str(row['id']);ids=[str(x) for x in row['handoffs']]
+                previous=db.execute('SELECT * FROM handoff_batch WHERE id=?',(key,)).fetchone()
+                if previous and previous['status']=='争议重开':
+                    if previous['body']!=json.dumps(row,sort_keys=True,ensure_ascii=False):raise ValueError('settlement_identity_conflict')
+                    results.append(decide(db,'承运交接',key,'争议重开','carrier_dispute',source));continue
                 handoffs=[db.execute('SELECT * FROM handoff WHERE id=?',(hid,)).fetchone() for hid in ids]
                 if not ids or len(set(ids))!=len(ids):status,reason='待核','invalid_scope'
                 elif any(h is None for h in handoffs):status,reason='待核','handoff_missing'
