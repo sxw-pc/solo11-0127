@@ -2,11 +2,17 @@
 import json
 from .ingest import capture
 from .store import connect,save,decide
+from . import delivery
+
+
+def _reconcile(db,source,parcels):
+    if not parcels:return []
+    return delivery.reconcile(db,source,parcels=sorted(parcels))
 
 
 def claim(path,file):
     source,payload=capture(path,'carrier_dispute_export',file)
-    db=connect(path);results=[]
+    db=connect(path);results=[];affected=set()
     try:
         with db:
             for row in payload.get('rows',[]):
@@ -23,6 +29,7 @@ def claim(path,file):
                 save(db,'carrier_claim',key,source,payload['version'],row,status,reason)
                 if status=='争议成立':
                     h=json.loads(handoff['body']);parcel_id=str(h['parcel'])
+                    affected.add(parcel_id)
                     db.execute("UPDATE handoff SET status='争议',reason='carrier_dispute' WHERE id=?",(handoff['id'],))
                     db.execute("UPDATE parcel SET status='召回中',reason='carrier_dispute' WHERE id=?",(parcel_id,))
                     save(db,'recall_case',f'recall:{key}',source,payload['version'],
@@ -31,13 +38,14 @@ def claim(path,file):
                     for batch_id in batches:
                         db.execute("UPDATE handoff_batch SET status='争议重开',reason='carrier_dispute' WHERE id=?",(batch_id,))
                 results.append(decide(db,'承运争议',key,status,reason,source))
+            _reconcile(db,source,affected)
         return results
     finally:db.close()
 
 
 def resolve(path,file):
     source,payload=capture(path,'carrier_recall_export',file)
-    db=connect(path);results=[]
+    db=connect(path);results=[];affected=set()
     try:
         with db:
             for row in payload.get('rows',[]):
@@ -47,7 +55,10 @@ def resolve(path,file):
                 elif row.get('parcel_returned'):
                     status,reason='已召回','parcel_returned'
                     db.execute("UPDATE recall_case SET status='已召回',reason='parcel_returned' WHERE id=?",(f'recall:{key}',))
+                    affected.add(str(json.loads(case['body'])['parcel']))
                 else:status,reason='追索中','parcel_outstanding'
                 results.append(decide(db,'承运争议',key,status,reason,source))
+            # A completed recall reopens the physical path; end proof follows.
+            _reconcile(db,source,affected)
         return results
     finally:db.close()

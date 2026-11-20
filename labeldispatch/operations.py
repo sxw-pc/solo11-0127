@@ -1,9 +1,15 @@
-"""Physical label copies, reprint authority, and carrier handoff."""
+"""Physical label copies, reprint authority, carrier handoff, and the
+per-parcel reconciliation that follows."""
 import json
 from datetime import datetime
-from pathlib import Path
 from .ingest import capture
 from .store import connect,save,decide
+from . import delivery
+
+
+def _reconcile(db,source,parcels):
+    if not parcels:return []
+    return delivery.reconcile(db,source,parcels=sorted(parcels))
 
 
 def _rows(db,table):
@@ -51,7 +57,7 @@ def first(path,file):
 
 def second(path,file):
     source,payload=capture(path,'reprint_request',file)
-    db=connect(path);results=[]
+    db=connect(path);results=[];affected=set()
     try:
         with db:
             for row in payload.get('rows',[]):
@@ -75,6 +81,7 @@ def second(path,file):
                 save(db,'reprint_grant',f'grant:{key}',source,payload['version'],grant,status,reason)
                 if status=='批准':
                     original=json.loads(old['body'])
+                    affected.add(str(original['parcel']))
                     db.execute("UPDATE print_copy SET status='作废',reason='authorized_reprint' WHERE id=?",(old['id'],))
                     replacement={'id':str(row['new_copy']),'parcel':original['parcel'],'paper_no':str(row['new_paper']),
                                  'template':original['template'],'required_template':original['required_template'],'printed':True}
@@ -82,39 +89,61 @@ def second(path,file):
                     from .resources import complete
                     complete(db,str(row['new_copy']),True)
                 results.append(decide(db,'重印许可',key,status,reason,source))
+            # A new label identity changes which proofs can be trusted.
+            _reconcile(db,source,affected)
         return results
     finally:db.close()
 
 
 def third(path,file):
     source,payload=capture(path,'carrier_handoff',file)
-    db=connect(path);results=[]
+    db=connect(path);results=[];affected=set()
     try:
         with db:
             for row in payload.get('rows',[]):
                 key=str(row['id']);copy=db.execute('SELECT * FROM print_copy WHERE id=?',(str(row['copy']),)).fetchone()
                 prior=db.execute('SELECT * FROM parcel WHERE id=?',(str(row['parcel']),)).fetchone()
+                same_as_prior=bool(prior and prior['body']==json.dumps(row,sort_keys=True,ensure_ascii=False))
+                # An authorized reprint supersedes the handed-off label, so the
+                # parcel may travel again under its new identity.  Any other
+                # second handoff of the same physical parcel is refused.
+                rehandoff=False
+                if prior and prior['status']=='已交接' and not same_as_prior:
+                    prior_copy=str(json.loads(prior['body']).get('copy',''))
+                    prior_row=db.execute('SELECT status FROM print_copy WHERE id=?',(prior_copy,)).fetchone()
+                    already=db.execute("SELECT 1 FROM handoff WHERE status='已交接' AND "
+                                       "json_extract(body,'$.parcel')=? AND json_extract(body,'$.copy')=? LIMIT 1",
+                                       (str(row['parcel']),str(row['copy']))).fetchone()
+                    rehandoff=bool(not already and prior_row and prior_row['status']!='有效'
+                                   and copy and copy['status']=='有效'
+                                   and json.loads(copy['body'])['parcel']==str(row['parcel']))
                 if prior and prior['status']=='召回中':status,reason='拒交','recall_open'
-                elif prior and prior['status']=='已交接' and prior['body']!=json.dumps(row,sort_keys=True,ensure_ascii=False):
+                elif prior and prior['status']=='已交接' and not same_as_prior and not rehandoff:
                     status,reason='拒交','parcel_already_handed_off'
                 elif not copy or copy['status']!='有效':status,reason='拒交','copy_not_valid'
                 elif json.loads(copy['body'])['parcel']!=str(row['parcel']):status,reason='拒交','copy_parcel_mismatch'
                 elif abs(float(row['actual_weight'])-float(row['declared_weight']))>float(row['tolerance']):status,reason='拒交','weight_mismatch'
                 elif row.get('courier')!=row.get('ack_courier') or row.get('ack_copy')!=row.get('copy'):status,reason='待核','ack_mismatch'
-                else:status,reason='已交接','carrier_verified'
+                else:status,reason='已交接','carrier_verified_after_reprint' if rehandoff else 'carrier_verified'
                 if not prior or prior['body']==json.dumps(row,sort_keys=True,ensure_ascii=False):
                     save(db,'parcel',str(row['parcel']),source,payload['version'],row,status,reason)
-                save(db,'handoff',key,source,payload['version'],{'parcel':row['parcel'],'copy':row['copy'],'courier':row.get('courier')},status,reason)
+                save(db,'handoff',key,source,payload['version'],
+                     {'parcel':row['parcel'],'copy':row['copy'],'courier':row.get('courier'),
+                      'seal':row.get('seal'),'at':row.get('at')},status,reason)
+                affected.add(str(row['parcel']))
                 results.append(decide(db,'承运交接',key,status,reason,source))
+            # Handoff identity and label status decide whether end proofs count.
+            _reconcile(db,source,affected)
         return results
     finally:db.close()
 
 
 def settle(path,file):
     source,payload=capture(path,'carrier_settlement',file)
-    db=connect(path);results=[]
+    db=connect(path);results=[];affected=set()
     try:
         with db:
+            fulfilment={x['parcel']:x for x in delivery.summarize(db)}
             for row in payload.get('rows',[]):
                 key=str(row['id']);ids=[str(x) for x in row['handoffs']]
                 previous=db.execute('SELECT * FROM handoff_batch WHERE id=?',(key,)).fetchone()
@@ -128,9 +157,17 @@ def settle(path,file):
                 else:status,reason='已结算','all_handoffs_confirmed'
                 save(db,'handoff_batch',key,source,payload['version'],row,status,reason)
                 for hid,h in zip(ids,handoffs):
+                    parcel=str(json.loads(h['body'])['parcel']) if h else ''
+                    state=fulfilment.get(parcel,{})
                     save(db,'settlement_item',f'{key}:{hid}',source,payload['version'],
-                         {'handoff':hid,'handoff_status':h['status'] if h else '缺失'},status,reason)
+                         {'handoff':hid,'handoff_status':h['status'] if h else '缺失',
+                          'parcel':parcel or None,
+                          'fulfilment':state.get('status','无末端证据'),
+                          'fulfilment_reason':state.get('reason')},status,reason)
+                    if h:affected.add(str(json.loads(h['body'])['parcel']))
                 results.append(decide(db,'承运交接',key,status,reason,source))
+            # Settlement remains a historical fact; it never freezes end proofs.
+            _reconcile(db,source,affected)
         return results
     finally:db.close()
 
