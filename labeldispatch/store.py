@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
-TABLES=['print_batch', 'print_copy', 'reprint_request', 'reprint_grant', 'parcel', 'handoff', 'handoff_batch', 'settlement_item', 'printer', 'paper_stock', 'printer_reservation', 'carrier_claim', 'recall_case']
+TABLES=['print_batch', 'print_copy', 'reprint_request', 'reprint_grant', 'parcel', 'handoff', 'handoff_batch', 'settlement_item', 'printer', 'paper_stock', 'printer_reservation', 'carrier_claim', 'recall_case',
+        'printer_receipt', 'physical_witness', 'print_evidence', 'paper_consumption', 'receipt_key']
 SCHEMA="""
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS export_file(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,version TEXT NOT NULL,hash TEXT NOT NULL,body BLOB NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(kind,hash));
@@ -20,6 +21,11 @@ CREATE TABLE IF NOT EXISTS paper_stock(id TEXT PRIMARY KEY,source_id INT REFEREN
 CREATE TABLE IF NOT EXISTS printer_reservation(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS carrier_claim(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS recall_case(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS printer_receipt(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS physical_witness(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS print_evidence(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS paper_consumption(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS receipt_key(id TEXT PRIMARY KEY,source_id INT REFERENCES export_file(id),version TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL);
 """
 def connect(path):
     p=Path(path);p.parent.mkdir(parents=True,exist_ok=True)
@@ -37,8 +43,15 @@ def save(db,table,key,source_id,version,body,status,reason):
         raise ValueError('identity_conflict')
     db.execute(f'INSERT INTO {table}(id,source_id,version,body,status,reason) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,reason=excluded.reason',
                (key,source_id,version,encoded,status,reason))
+def put(db,table,key,source_id,version,body,status,reason):
+    """Upsert a derived row. Only for evidence, never for captured source rows."""
+    import json
+    if table not in TABLES:raise ValueError('unknown_table')
+    encoded=json.dumps(body,sort_keys=True,ensure_ascii=False)
+    db.execute(f'INSERT INTO {table}(id,source_id,version,body,status,reason) VALUES (?,?,?,?,?,?) '
+               'ON CONFLICT(id) DO UPDATE SET source_id=excluded.source_id,version=excluded.version,body=excluded.body,status=excluded.status,reason=excluded.reason',
+               (key,source_id,version,encoded,status,reason))
 def decide(db,subsystem,subject,status,reason,source_id):
     db.execute('INSERT OR IGNORE INTO decision_log(subsystem,subject,status,reason,source_id) VALUES (?,?,?,?,?)',
                (subsystem,subject,status,reason,source_id))
     return {'subject':subject,'status':status,'reason':reason}
-

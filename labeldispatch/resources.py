@@ -1,7 +1,7 @@
 """Printer routing and paper allocation before physical label creation."""
 import json
 from .ingest import capture
-from .store import connect,save,decide
+from .store import connect,save,put,decide
 
 
 def plan(path,file):
@@ -40,12 +40,48 @@ def plan(path,file):
     finally:db.close()
 
 
-def complete(db,copy_id,printed):
-    row=db.execute('SELECT * FROM printer_reservation WHERE id=?',(str(copy_id),)).fetchone()
+def complete(db,copy_id,authorized,evidence=None):
+    """Consume the paper reservation only for trusted physical output.
+
+    ``authorized`` must come from the evidence chain (authenticated device
+    receipt or complete dual-witness scans), never from a queue boolean.
+    Consumption is recorded once per copy so replays and key rotation cannot
+    count the same physical sheet twice.
+    """
+    key=str(copy_id)
+    row=db.execute('SELECT * FROM printer_reservation WHERE id=?',(key,)).fetchone()
     if not row:return None
-    if row['status']=='已预留' and printed:
-        db.execute("UPDATE printer_reservation SET status='已消耗',reason='paper_consumed' WHERE id=?",(copy_id,))
-    return row['status']
+    if row['status']!='已预留' or not authorized:
+        return row['status']
+    body=json.loads(row['body'])
+    printer=body.get('printer');stock_paper=body.get('paper')
+    evidence=evidence or {}
+    consumption_id=f'paper:{key}'
+    old=db.execute('SELECT * FROM paper_consumption WHERE id=?',(consumption_id,)).fetchone()
+    record={'copy_id':key,'printer':printer,'paper':stock_paper,
+            'paper_no':evidence.get('paper_no'),'evidence_level':evidence.get('level'),
+            'receipt_ids':evidence.get('accepted_receipt_ids',[]),
+            'witness_ids':evidence.get('witness_ids',[]),
+            'queue_digest':evidence.get('queue_digest')}
+    if old:
+        prior=json.loads(old['body'])
+        if prior.get('paper_no')!=record.get('paper_no') or prior.get('printer')!=printer:
+            db.execute('INSERT INTO issue(source_id,code,detail) VALUES (?,?,?)',
+                       (row['source_id'],'paper_consumption_conflict',consumption_id))
+            return row['status']
+        return row['status']
+    # The stock snapshot is captured source data and is never rewritten.
+    # Consumption is recorded separately; available stock is derived as
+    # snapshot count minus accepted consumption records.
+    stock=db.execute("SELECT * FROM paper_stock WHERE json_extract(body,'$.printer')=? "
+                     "AND json_extract(body,'$.paper')=? ORDER BY id DESC",
+                     (printer,stock_paper)).fetchall()
+    if stock:
+        record['stock_id']=stock[0]['id']
+        record['snapshot_available']=int(json.loads(stock[0]['body']).get('available',0))
+    put(db,'paper_consumption',consumption_id,row['source_id'],row['version'],record,'已消耗','paper_consumed')
+    db.execute("UPDATE printer_reservation SET status='已消耗',reason='paper_consumed' WHERE id=?",(key,))
+    return '已消耗'
 
 
 def cancel(path,file):
