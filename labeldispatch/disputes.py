@@ -30,6 +30,8 @@ def claim(path,file):
                     batches=[x['id'] for x in db.execute('SELECT * FROM handoff_batch') if handoff['id'] in json.loads(x['body'])['handoffs']]
                     for batch_id in batches:
                         db.execute("UPDATE handoff_batch SET status='争议重开',reason='carrier_dispute' WHERE id=?",(batch_id,))
+                    from . import billing
+                    billing.on_handoff_disputed(db,handoff['id'],source,payload['version'])
                 results.append(decide(db,'承运争议',key,status,reason,source))
         return results
     finally:db.close()

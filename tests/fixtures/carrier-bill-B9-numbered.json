@@ -1,0 +1,21 @@
+{
+  "version": "v1",
+  "rows": [
+    {
+      "batch": "B9",
+      "handoff_date": "2026-01-31",
+      "service_tier": "std",
+      "billing_window": "W1",
+      "amount_cents": 1000,
+      "carrier_line_no": "L1"
+    },
+    {
+      "batch": "B9",
+      "handoff_date": "2026-01-31",
+      "service_tier": "std",
+      "billing_window": "W1",
+      "amount_cents": 1400,
+      "carrier_line_no": "L2"
+    }
+  ]
+}

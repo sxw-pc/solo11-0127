@@ -104,7 +104,10 @@ def third(path,file):
                 else:status,reason='已交接','carrier_verified'
                 if not prior or prior['body']==json.dumps(row,sort_keys=True,ensure_ascii=False):
                     save(db,'parcel',str(row['parcel']),source,payload['version'],row,status,reason)
-                save(db,'handoff',key,source,payload['version'],{'parcel':row['parcel'],'copy':row['copy'],'courier':row.get('courier')},status,reason)
+                handoff_body={'parcel':row['parcel'],'copy':row['copy'],'courier':row.get('courier')}
+                for kept in ('batch','handoff_date','service_tier','billing_window','carrier_line_no'):
+                    if row.get(kept) is not None:handoff_body[kept]=row[kept]
+                save(db,'handoff',key,source,payload['version'],handoff_body,status,reason)
                 results.append(decide(db,'承运交接',key,status,reason,source))
         return results
     finally:db.close()

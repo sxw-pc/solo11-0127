@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "source_digest": "62227f955a7421180df449472eb61dd420d179f061d961300d29cbceebafe1e6",
+  "rows": [
+    {
+      "batch": "B9",
+      "carrier_line_no": "L1",
+      "handoff": "H1"
+    },
+    {
+      "batch": "B9",
+      "carrier_line_no": "L2",
+      "handoff": "H2"
+    }
+  ]
+}
